@@ -5,6 +5,7 @@ import path from "node:path";
 import process from "node:process";
 import { spawn } from "node:child_process";
 import { Bot, GrammyError, HttpError } from "grammy";
+import { run } from "@grammyjs/runner";
 import { HttpsProxyAgent } from "https-proxy-agent";
 
 const homeDir = os.homedir();
@@ -14,7 +15,11 @@ const timeoutMs = 900000;
 const codexCommand = "codex";
 const model = "gpt-5.6-luna";
 const reasoningEffort = "medium";
+const busyMessage = "当前有任务正在执行，请稍候。你可以发送 /status 查看状态。";
 const telegramProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+const activeChildren = new Set();
+let activeRunner;
+let shuttingDown = false;
 
 function log(level, event, fields = {}) {
   const entry = { time: new Date().toISOString(), level, event, pid: process.pid, ...fields };
@@ -33,7 +38,17 @@ process.on("unhandledRejection", (reason) => {
 });
 
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
-  process.on(signal, () => log("warn", "process.signal", { signal }));
+  process.once(signal, () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log("warn", "process.signal", { signal });
+    activeRunner?.stop();
+    for (const child of activeChildren) child.kill("SIGTERM");
+    const forceKillTimer = setTimeout(() => {
+      for (const child of activeChildren) child.kill("SIGKILL");
+    }, 10000);
+    forceKillTimer.unref();
+  });
 }
 
 if (!process.env.TELEGRAM_BOT_TOKEN) {
@@ -42,7 +57,8 @@ if (!process.env.TELEGRAM_BOT_TOKEN) {
 
 const bot = new Bot(process.env.TELEGRAM_BOT_TOKEN, {
   client: {
-    timeoutSeconds: 15,
+    // runner 的 getUpdates 长轮询默认是 30 秒，HTTP 超时必须更长。
+    timeoutSeconds: 45,
     baseFetchConfig: telegramProxy ? { agent: new HttpsProxyAgent(telegramProxy) } : {},
   },
 });
@@ -109,6 +125,7 @@ function runCodex(sessionId, prompt, requestId) {
       env: process.env,
       stdio: ["ignore", "pipe", "pipe"],
     });
+    activeChildren.add(child);
     let stdout = "";
     let stderr = "";
     let settled = false;
@@ -141,18 +158,20 @@ function runCodex(sessionId, prompt, requestId) {
       });
       finish(error);
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
+      activeChildren.delete(child);
       log(code === 0 ? "info" : "error", "codex.closed", {
         requestId,
         pid: child.pid,
         code,
+        signal,
         durationMs: Date.now() - startedAt,
         stdoutBytes: Buffer.byteLength(stdout),
         stderrBytes: Buffer.byteLength(stderr),
         stderrTail: stderr.trim().slice(-2000),
       });
       if (code !== 0) {
-        finish(new Error(stderr.trim() || `Codex exited with code ${code}`));
+        finish(new Error(stderr.trim() || (signal ? `Codex terminated by ${signal}` : `Codex exited with code ${code}`)));
         return;
       }
       finish(null, parseCodexOutput(stdout));
@@ -202,11 +221,13 @@ bot.command("help", (ctx) => ctx.reply("发送文本给 Codex。\n/new 新建 se
 bot.command("new", async (ctx) => {
   const chatId = String(ctx.chat.id);
   log("info", "command.new", { chatId });
-  await enqueue(chatId, async () => {
-    delete sessions[chatId];
-    await saveSessions();
-    await ctx.reply("已新建 session。下一条消息将开始新的 Codex 会话。");
-  });
+  if (activeRequests.has(chatId)) {
+    await ctx.reply(busyMessage);
+    return;
+  }
+  delete sessions[chatId];
+  await saveSessions();
+  await ctx.reply("已新建 session。下一条消息将开始新的 Codex 会话。");
 });
 
 bot.command("status", async (ctx) => {
@@ -225,6 +246,11 @@ bot.on("message:text", async (ctx) => {
   const prompt = ctx.message.text.trim();
   if (!prompt) return;
   const chatId = String(ctx.chat.id);
+  if (activeRequests.has(chatId)) {
+    log("info", "request.rejected_busy", { chatId, messageId: ctx.message.message_id });
+    await ctx.reply(busyMessage);
+    return;
+  }
   const requestId = `${chatId}:${ctx.message.message_id}:${Date.now()}`;
   log("info", "telegram.message_received", {
     requestId,
@@ -273,7 +299,26 @@ log("info", "server.started", {
 });
 log("info", "telegram.connecting");
 try {
-  await bot.start({ onStart: (info) => log("info", "telegram.running", { username: info.username }) });
+  while (!shuttingDown) {
+    activeRunner = run(bot, {
+      runner: {
+        retryInterval: 5000,
+        maxRetryTime: 60 * 60 * 1000,
+      },
+      sink: { concurrency: 32 },
+    });
+    log("info", "telegram.running", { concurrency: 32, retryIntervalMs: 5000 });
+    try {
+      await activeRunner.task();
+    } catch (error) {
+      if (!shuttingDown) {
+        log("error", "telegram.runner_failed", { error: error?.stack || String(error) });
+        await new Promise((resolve) => setTimeout(resolve, 5000));
+      }
+    } finally {
+      activeRunner = undefined;
+    }
+  }
 } catch (error) {
   log("error", "telegram.startup_failed", {
     error: error?.stack || error.description || error.message || String(error),
