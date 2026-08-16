@@ -16,6 +16,26 @@ const model = "gpt-5.6-luna";
 const reasoningEffort = "medium";
 const telegramProxy = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
 
+function log(level, event, fields = {}) {
+  const entry = { time: new Date().toISOString(), level, event, pid: process.pid, ...fields };
+  const output = JSON.stringify(entry);
+  if (level === "error") console.error(output);
+  else console.log(output);
+}
+
+process.on("uncaughtException", (error) => {
+  log("error", "process.uncaught_exception", { error: error?.stack || String(error) });
+  process.exitCode = 1;
+});
+
+process.on("unhandledRejection", (reason) => {
+  log("error", "process.unhandled_rejection", { error: reason?.stack || String(reason) });
+});
+
+for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"]) {
+  process.on(signal, () => log("warn", "process.signal", { signal }));
+}
+
 if (!process.env.TELEGRAM_BOT_TOKEN) {
   throw new Error("TELEGRAM_BOT_TOKEN is required");
 }
@@ -51,10 +71,14 @@ async function saveSessions() {
 
 function enqueue(chatId, task) {
   const previous = activeRequests.get(chatId) || Promise.resolve();
+  if (activeRequests.has(chatId)) {
+    log("info", "request.queued", { chatId, activeRequests: activeRequests.size });
+  }
   const current = previous.catch(() => {}).then(task);
   activeRequests.set(chatId, current);
   return current.finally(() => {
     if (activeRequests.get(chatId) === current) activeRequests.delete(chatId);
+    log("info", "request.queue_finished", { chatId, activeRequests: activeRequests.size });
   });
 }
 
@@ -72,8 +96,14 @@ function codexArgs(sessionId, prompt) {
   return args;
 }
 
-function runCodex(sessionId, prompt) {
+function runCodex(sessionId, prompt, requestId) {
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    log("info", "codex.spawn_start", {
+      requestId,
+      resumed: Boolean(sessionId),
+      promptLength: prompt.length,
+    });
     const child = spawn(codexCommand, codexArgs(sessionId, prompt), {
       cwd: workdir,
       env: process.env,
@@ -83,6 +113,12 @@ function runCodex(sessionId, prompt) {
     let stderr = "";
     let settled = false;
     const timer = setTimeout(() => {
+      log("error", "codex.timeout", {
+        requestId,
+        pid: child.pid,
+        durationMs: Date.now() - startedAt,
+        timeoutMs,
+      });
       child.kill("SIGTERM");
       finish(new Error(`Codex timed out after ${timeoutMs}ms`));
     }, timeoutMs);
@@ -96,8 +132,25 @@ function runCodex(sessionId, prompt) {
 
     child.stdout.on("data", (chunk) => { stdout += chunk; });
     child.stderr.on("data", (chunk) => { stderr += chunk; });
-    child.on("error", (error) => finish(error));
+    child.on("error", (error) => {
+      log("error", "codex.spawn_error", {
+        requestId,
+        pid: child.pid,
+        durationMs: Date.now() - startedAt,
+        error: error.stack || String(error),
+      });
+      finish(error);
+    });
     child.on("close", (code) => {
+      log(code === 0 ? "info" : "error", "codex.closed", {
+        requestId,
+        pid: child.pid,
+        code,
+        durationMs: Date.now() - startedAt,
+        stdoutBytes: Buffer.byteLength(stdout),
+        stderrBytes: Buffer.byteLength(stderr),
+        stderrTail: stderr.trim().slice(-2000),
+      });
       if (code !== 0) {
         finish(new Error(stderr.trim() || `Codex exited with code ${code}`));
         return;
@@ -148,6 +201,7 @@ bot.command("help", (ctx) => ctx.reply("发送文本给 Codex。\n/new 新建 se
 
 bot.command("new", async (ctx) => {
   const chatId = String(ctx.chat.id);
+  log("info", "command.new", { chatId });
   await enqueue(chatId, async () => {
     delete sessions[chatId];
     await saveSessions();
@@ -157,6 +211,7 @@ bot.command("new", async (ctx) => {
 
 bot.command("status", async (ctx) => {
   const chatId = String(ctx.chat.id);
+  log("info", "command.status", { chatId });
   const sessionId = sessions[chatId]?.sessionId;
   await ctx.reply([
     `session: ${sessionId || "未创建"}`,
@@ -170,32 +225,58 @@ bot.on("message:text", async (ctx) => {
   const prompt = ctx.message.text.trim();
   if (!prompt) return;
   const chatId = String(ctx.chat.id);
+  const requestId = `${chatId}:${ctx.message.message_id}:${Date.now()}`;
+  log("info", "telegram.message_received", {
+    requestId,
+    chatId,
+    messageId: ctx.message.message_id,
+    promptLength: prompt.length,
+  });
   await enqueue(chatId, async () => {
     const current = sessions[chatId]?.sessionId;
-    await ctx.reply(current ? "正在继续 Codex session…" : "正在创建 Codex session…");
     try {
-      const result = await runCodex(current, prompt);
+      await ctx.reply(current ? "正在继续 Codex session…" : "正在创建 Codex session…");
+      log("info", "telegram.ack_sent", { requestId, chatId, resumed: Boolean(current) });
+      const result = await runCodex(current, prompt, requestId);
       sessions[chatId] = { sessionId: result.sessionId || current, updatedAt: new Date().toISOString() };
       await saveSessions();
       await sendLongMessage(ctx, result.answer);
+      log("info", "telegram.response_sent", { requestId, chatId, answerLength: result.answer.length });
     } catch (error) {
-      await ctx.reply(`Codex 调用失败：${error.message}`);
+      log("error", "request.failed", { requestId, chatId, error: error?.stack || String(error) });
+      try {
+        await ctx.reply(`Codex 调用失败：${error.message}`);
+      } catch (replyError) {
+        log("error", "telegram.error_reply_failed", {
+          requestId,
+          chatId,
+          error: replyError?.stack || String(replyError),
+        });
+      }
     }
   });
 });
 
 bot.catch((error) => {
   const cause = error.error;
-  if (cause instanceof GrammyError) console.error("Telegram request failed:", cause.description);
-  else if (cause instanceof HttpError) console.error("Telegram network failed:", cause);
-  else console.error("Bot error:", cause);
+  if (cause instanceof GrammyError) log("error", "telegram.request_failed", { description: cause.description });
+  else if (cause instanceof HttpError) log("error", "telegram.network_failed", { error: cause.stack || String(cause) });
+  else log("error", "bot.error", { error: cause?.stack || String(cause) });
 });
 
-console.log(`Telegram Codex server started; workdir=${workdir}`);
-console.log("Connecting to Telegram API…");
+log("info", "server.started", {
+  workdir,
+  storePath,
+  model,
+  timeoutMs,
+  proxyConfigured: Boolean(telegramProxy),
+});
+log("info", "telegram.connecting");
 try {
-  await bot.start({ onStart: (info) => console.log(`@${info.username} is running`) });
+  await bot.start({ onStart: (info) => log("info", "telegram.running", { username: info.username }) });
 } catch (error) {
-  console.error("Telegram startup failed:", error.description || error.message || error);
+  log("error", "telegram.startup_failed", {
+    error: error?.stack || error.description || error.message || String(error),
+  });
   process.exitCode = 1;
 }
