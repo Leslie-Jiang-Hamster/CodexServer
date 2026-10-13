@@ -1,5 +1,5 @@
 {
-  "name": "telegram-codex-server",
+  "name": "feishu-codex-server",
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -7,9 +7,8 @@
     "start": "node src/server.js"
   },
   "dependencies": {
-    "@grammyjs/runner": "^2.0.3",
+    "@larksuiteoapi/node-sdk": "^1.73.3",
     "dotenv": "^16.4.7",
-    "grammy": "^1.35.0",
     "https-proxy-agent": "^7.0.6"
   }
 }
